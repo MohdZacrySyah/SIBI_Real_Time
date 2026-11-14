@@ -108,13 +108,10 @@ class NativeCameraBridge extends PlatformCameraBridge {
             // Pemrosesan frame normal dari background isolate
             if (!state.mounted) return;
 
-            // Jalankan pengklasifikasi sekuensial dinamis SibiClassifier di Dart
-            final classificationResult = state.widget.classifier.classify(message.hands);
-
-            // Teruskan data prediksi ke CameraViewState
+            // Teruskan data frame dan deteksi tangan ke CameraViewState tanpa klasifikasi ganda
             state.onPredictionResult(CameraPrediction(
-              label: classificationResult.label,
-              confidence: classificationResult.confidence,
+              label: '',
+              confidence: 0.0,
               inferenceTimeMs: message.inferenceTimeMs,
               hands: message.hands,
               imageBytes: message.imageBytes,
@@ -337,15 +334,10 @@ class NativeCameraBridge extends PlatformCameraBridge {
         return AppHand(landmarks: appLms);
       }).toList();
 
-      final startTime = DateTime.now();
-      final classificationResult = state.widget.classifier.classify(appHands);
-      final endTime = DateTime.now();
-      final inferenceTimeMs = (endTime.difference(startTime).inMicroseconds) / 1000.0;
-
       state.onPredictionResult(CameraPrediction(
-        label: classificationResult.label,
-        confidence: classificationResult.confidence,
-        inferenceTimeMs: inferenceTimeMs,
+        label: '',
+        confidence: 0.0,
+        inferenceTimeMs: 0.0,
         hands: appHands,
       ));
     } finally {

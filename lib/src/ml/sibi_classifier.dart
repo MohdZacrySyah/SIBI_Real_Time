@@ -10,10 +10,10 @@ import 'platform_classifier.dart';
 /// ============================================================================
 /// KELAS UTAMA: SibiClassifier (Intelligent Auto-Hybrid SIBI Translator)
 /// ============================================================================
-/// Menyatukan 2 Mesin AI ke dalam 1 Mode Otomatis Tanpa Tombol Switch:
-/// • Mesin 1: Alphabet Fingerspelling DNN (26 Huruf A–Z, statis per-frame [1, 63])
-/// • Mesin 2: Dynamic Word Gestures CNN-LSTM (7 Kata Dasar, temporal 30-frame [1, 30, 63])
-/// • Intelligent Arbiter: Otomatis mendeteksi varians gerak dinamis vs pose statis.
+/// Mengintegrasikan 2 Model TFLite On-Device:
+/// • Model 1: Alphabet Fingerspelling DNN (26 Huruf A–Z, masukan 63 fitur landmark per-frame [1, 63])
+/// • Model 2: Dynamic Word Gestures CNN-LSTM (7 Kata Dasar, masukan sekuens 30 frame [1, 30, 63])
+/// • Intelligent Arbiter: Otomatis mendeteksi varians energi gerakan dinamis vs pose statis (dengan opsi mode manual).
 class SibiClassifier extends PlatformClassifier {
   // Interpreter Mesin 1: Alphabet Fingerspelling (DNN)
   Interpreter? _alphabetInterpreter;
@@ -136,6 +136,7 @@ class SibiClassifier extends PlatformClassifier {
   /// Eksekusi klasifikasi cerdas dalam satu mode otomatis (Auto-Routing) dengan cadangan manual
   @override
   PredictionResult classify(List<AppHand> hands, {String mode = 'auto'}) {
+    final inferenceStopwatch = Stopwatch()..start();
     if (hands.isEmpty) {
       _missingFramesCount++;
       if (_missingFramesCount > 10) {
@@ -145,10 +146,12 @@ class SibiClassifier extends PlatformClassifier {
         _consecutiveLowMotionFrames = 0;
         _isInDynamicWordMode = false;
       }
+      inferenceStopwatch.stop();
       return PredictionResult(
         label: 'Menunggu Gesture...',
         confidence: 0.0,
         inferenceSource: 'SIBI Auto-Hybrid',
+        inferenceTimeMs: 0.0,
       );
     }
 
@@ -219,6 +222,8 @@ class SibiClassifier extends PlatformClassifier {
     
     // A. MODE CADANGAN: KHUSUS KATA
     if (mode == 'word') {
+      inferenceStopwatch.stop();
+      final elapsedMs = inferenceStopwatch.elapsedMicroseconds / 1000.0;
       if (wordResult != null &&
           wordResult.maxProb >= _wordConfidenceThreshold &&
           wordResult.maxIndex != -1) {
@@ -229,6 +234,7 @@ class SibiClassifier extends PlatformClassifier {
           label: wordLabel,
           confidence: wordResult.maxProb,
           inferenceSource: 'Model 2: Kata Dinamis (CNN-LSTM)',
+          inferenceTimeMs: elapsedMs,
         );
         return _lastPrediction;
       }
@@ -236,11 +242,14 @@ class SibiClassifier extends PlatformClassifier {
         label: 'Menunggu Gerakan Kata...',
         confidence: wordResult?.maxProb ?? 0.0,
         inferenceSource: 'Model 2: Kata Dinamis (CNN-LSTM)',
+        inferenceTimeMs: elapsedMs,
       );
     }
 
     // B. MODE CADANGAN: KHUSUS HURUF
     if (mode == 'alphabet') {
+      inferenceStopwatch.stop();
+      final elapsedMs = inferenceStopwatch.elapsedMicroseconds / 1000.0;
       if (alphaResult != null &&
           alphaResult.maxProb >= _alphabetConfidenceThreshold &&
           alphaResult.maxIndex != -1) {
@@ -256,6 +265,7 @@ class SibiClassifier extends PlatformClassifier {
           label: smoothedLabel,
           confidence: alphaResult.maxProb,
           inferenceSource: 'Model 1: Ejaan Huruf (DNN)',
+          inferenceTimeMs: elapsedMs,
         );
         return _lastPrediction;
       }
@@ -263,6 +273,7 @@ class SibiClassifier extends PlatformClassifier {
         label: 'Menunggu Pose Huruf...',
         confidence: alphaResult?.maxProb ?? 0.0,
         inferenceSource: 'Model 1: Ejaan Huruf (DNN)',
+        inferenceTimeMs: elapsedMs,
       );
     }
 
@@ -271,6 +282,9 @@ class SibiClassifier extends PlatformClassifier {
     // 1. Status hysteresis berada di mode kata (_isInDynamicWordMode == true)
     // 2. Model Kata memiliki confidence >= 0.65
     // Jika tidak memenuhi, sistem otomatis jatuh kembali (fallback) ke mode huruf.
+    inferenceStopwatch.stop();
+    final elapsedMs = inferenceStopwatch.elapsedMicroseconds / 1000.0;
+
     if (_isInDynamicWordMode &&
         wordResult != null &&
         wordResult.maxProb >= _wordConfidenceThreshold &&
@@ -286,6 +300,7 @@ class SibiClassifier extends PlatformClassifier {
         label: wordLabel,
         confidence: wordResult.maxProb,
         inferenceSource: 'Model 2: Kata Dinamis (CNN-LSTM)',
+        inferenceTimeMs: elapsedMs,
       );
       return _lastPrediction;
     }
@@ -308,6 +323,7 @@ class SibiClassifier extends PlatformClassifier {
         label: smoothedLabel,
         confidence: alphaResult.maxProb,
         inferenceSource: 'Model 1: Ejaan Huruf (DNN)',
+        inferenceTimeMs: elapsedMs,
       );
       return _lastPrediction;
     }
@@ -317,14 +333,15 @@ class SibiClassifier extends PlatformClassifier {
       label: 'Menunggu Gesture...',
       confidence: 0.0,
       inferenceSource: 'SIBI Auto-Hybrid',
+      inferenceTimeMs: elapsedMs,
     );
   }
 
-  /// Menghitung tingkat varians pergerakan tangan dalam sekuens 30 frame
+  /// Menghitung tingkat varians pergerakan tangan dalam sekuens frame (energi gerak delta E)
   double _calculateTemporalMotionEnergy(List<List<double>> window) {
     if (window.length < 10) return 0.0;
     double totalDisplacement = 0.0;
-    // Hitung pergeseran koordinat ujung jari telunjuk & tengah (titik 8 dan 12)
+    // Hitung pergeseran koordinat 21 titik landmark tangan (63 koordinat x, y, z)
     for (int i = 1; i < window.length; i++) {
       final prev = window[i - 1];
       final curr = window[i];

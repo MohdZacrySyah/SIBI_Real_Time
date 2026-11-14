@@ -330,7 +330,10 @@ class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProv
                                                 label: 'STOP',
                                                 color: AppTheme.dangerRose,
                                                 isOutlined: true,
-                                                onPressed: !state.isPaused ? () => state.togglePause() : null,
+                                                onPressed: state.isCameraActive ? () {
+                                                  _cameraKey.currentState?.stopCamera();
+                                                  state.setCameraActive(false, message: 'Kamera dinonaktifkan.');
+                                                } : null,
                                                 isCompact: true,
                                               ),
                                             ],
@@ -518,7 +521,10 @@ class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProv
                                       label: 'STOP',
                                       color: AppTheme.dangerRose,
                                       isOutlined: true,
-                                      onPressed: !state.isPaused ? () => state.togglePause() : null,
+                                      onPressed: state.isCameraActive ? () {
+                                        _cameraKey.currentState?.stopCamera();
+                                        state.setCameraActive(false, message: 'Kamera dinonaktifkan.');
+                                      } : null,
                                       isCompact: isCompactScreen,
                                     ),
                                   ],

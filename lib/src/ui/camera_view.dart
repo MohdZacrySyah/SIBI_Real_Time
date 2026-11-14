@@ -96,21 +96,24 @@ class CameraViewState extends State<CameraView> {
     // Hitung kecepatan bingkai (FPS)
     _calculateFps();
 
-    // Perbarui metrik performa di SibiState
-    state.updatePerformanceMetrics(
-      fps: _currentCalculatedFps > 0 ? _currentCalculatedFps : 30.0,
-      inferenceTimeMs: prediction.inferenceTimeMs,
-      latencyMs: prediction.inferenceTimeMs + 5.0,
-      confidence: prediction.confidence,
-    );
-
     // Update frame gambar Windows jika disediakan (Windows Only)
     if (prediction.imageBytes != null) {
       state.updateStreamedImage(prediction.imageBytes);
     }
 
-    // PENTING: Jalankan AI Inference di Main Isolate dengan mode yang dipilih (Auto / Alphabet / Word)
+    // PENTING: Jalankan AI Inference di Main Isolate satu kali per frame dengan mode yang dipilih (Auto / Alphabet / Word)
     final result = widget.classifier.classify(prediction.hands, mode: state.translationMode);
+
+    // Hitung latency end-to-end sesungguhnya (dari frame diterima hingga prediksi teks selesai)
+    final latencyMs = (DateTime.now().difference(prediction.timestamp).inMicroseconds) / 1000.0;
+
+    // Perbarui metrik performa di SibiState dengan data pengukuran riil
+    state.updatePerformanceMetrics(
+      fps: _currentCalculatedFps,
+      inferenceTimeMs: result.inferenceTimeMs,
+      latencyMs: latencyMs,
+      confidence: result.confidence,
+    );
 
     // Update status mesin aktif di SibiState ("Huruf", "Kata", atau "Menunggu")
     if (result.inferenceSource.contains('Kata')) {

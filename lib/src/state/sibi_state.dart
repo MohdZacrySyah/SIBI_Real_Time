@@ -213,9 +213,9 @@ class SibiState extends ChangeNotifier {
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       text: _translatedText.trim(),
       timestamp: DateTime.now(),
-      confidence: _confidence > 0 ? _confidence : 0.88, // default fallback confidence if simulated
-      avgFps: _fps > 0 ? _fps : 30.0,
-      avgLatencyMs: _inferenceTimeMs > 0 ? _inferenceTimeMs : 12.0,
+      confidence: _confidence,
+      avgFps: _fps,
+      avgLatencyMs: _latencyMs,
     );
 
     _history.insert(0, record);

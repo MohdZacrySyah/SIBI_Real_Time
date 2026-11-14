@@ -16,6 +16,7 @@ class CameraPrediction {
   final double inferenceTimeMs;
   final List<AppHand> hands;
   final Uint8List? imageBytes;
+  final DateTime timestamp;
 
   CameraPrediction({
     required this.label,
@@ -23,5 +24,6 @@ class CameraPrediction {
     required this.inferenceTimeMs,
     required this.hands,
     this.imageBytes,
-  });
+    DateTime? timestamp,
+  }) : timestamp = timestamp ?? DateTime.now();
 }

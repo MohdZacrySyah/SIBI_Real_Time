@@ -4,11 +4,13 @@ class PredictionResult {
   final String label;
   final double confidence;
   final String inferenceSource;
+  final double inferenceTimeMs;
 
   PredictionResult({
     required this.label,
     required this.confidence,
     required this.inferenceSource,
+    this.inferenceTimeMs = 0.0,
   });
 }
 
