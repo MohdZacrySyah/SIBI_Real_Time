@@ -1,61 +1,46 @@
-import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
-import 'dart:math' as math;
-import 'dart:ffi' as ffi;
-import 'package:ffi/ffi.dart';
-import 'package:camera/camera.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:hand_landmarker/hand_landmarker.dart' as mp;
 import 'package:provider/provider.dart';
+import 'package:camera/camera.dart';
 import '../ml/hand_landmark.dart';
-import '../ml/sibi_classifier.dart';
+import '../ml/platform_classifier.dart';
 import '../state/sibi_state.dart';
-import '../ml/sibi_vision_ffi.dart';
+import '../ml/camera_bridge.dart';
+import '../ml/platform_camera_bridge.dart';
 import 'theme.dart';
 
 class CameraView extends StatefulWidget {
-  final SibiClassifier classifier;
+  final PlatformClassifier classifier;
+  final bool isExpanded;
 
-  const CameraView({super.key, required this.classifier});
+  const CameraView({
+    super.key, 
+    required this.classifier,
+    this.isExpanded = false,
+  });
 
   @override
   State<CameraView> createState() => CameraViewState();
 }
 
 class CameraViewState extends State<CameraView> {
-  CameraController? _controller;
-  mp.HandLandmarkerPlugin? _landmarkerPlugin;
-  StreamSubscription<List<mp.Hand>>? _landmarkSubscription;
+  late final PlatformCameraBridge _cameraBridge;
   bool _isCameraInitializing = false;
-  bool _isStreamProcessing = false;
-  CameraLensDirection _preferredLensDirection = CameraLensDirection.front;
-  static List<CameraDescription>? _cachedCameras;
-  
+
   // Debouncing State untuk Pengetikan Huruf
-  String _lastConfirmedChar = '';
   String _currentBufferChar = '';
   DateTime? _bufferStartTime;
-  final Duration _debounceThreshold = const Duration(milliseconds: 1000);
+  String _lastEmittedChar = ''; // Mencegah spam gesture yang sama
+  final Duration _debounceThreshold = const Duration(milliseconds: 350); // Waktu tahan gesture 350ms
+  String _lastLiveLabel = 'Menunggu Gesture...';
+  String _lastLiveDisplay = 'Menunggu Gesture...';
 
   // FPS tracking variables
   int _fpsFrameCount = 0;
   DateTime? _fpsStartTime;
   double _currentCalculatedFps = 0.0;
-
-  // Windows FFI variables
-  SibiVisionFFI? _ffi;
-  bool _isFfiProcessing = false;
-  ffi.Pointer<ffi.Uint8>? _ffiImageBuffer;
-  ffi.Pointer<ffi.Int32>? _ffiImageSizePtr;
-  ffi.Pointer<ffi.Float>? _ffiLandmarksPtr;
-  ffi.Pointer<ffi.Int32>? _ffiPredIndexPtr;
-  ffi.Pointer<ffi.Float>? _ffiPredConfidencePtr;
-  Timer? _ffiTimer;
 
   bool _wasPaused = false;
   late SibiState _sibiState;
@@ -63,20 +48,14 @@ class CameraViewState extends State<CameraView> {
   @override
   void initState() {
     super.initState();
+    _cameraBridge = createCameraBridge();
     _sibiState = Provider.of<SibiState>(context, listen: false);
     _sibiState.addListener(_onStateChanged);
 
-    // Jalankan kamera secara otomatis jika di Android/Mobile
-    if (defaultTargetPlatform == TargetPlatform.android || defaultTargetPlatform == TargetPlatform.iOS) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _initCameraAndPlugin();
-      });
-    } else if (defaultTargetPlatform == TargetPlatform.windows) {
-      // Langsung jalankan FFI Windows secara otomatis
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        initWindowsFFI();
-      });
-    }
+    // Jangan mulai kamera otomatis di awal, tunggu aksi user
+    // WidgetsBinding.instance.addPostFrameCallback((_) {
+    //   _cameraBridge.initCamera(this);
+    // });
   }
 
   void _onStateChanged() {
@@ -85,390 +64,116 @@ class CameraViewState extends State<CameraView> {
       _wasPaused = _sibiState.isPaused;
       if (_wasPaused) {
         // Mode jeda diaktifkan: Matikan kamera secara fisik
-        if (defaultTargetPlatform == TargetPlatform.android) {
-          _disposeCamera();
-        } else {
-          _disposeWindowsFFI();
-        }
+        _cameraBridge.disposeCamera(this);
       } else {
         // Mode jeda dimatikan: Hidupkan kembali kamera
-        if (defaultTargetPlatform == TargetPlatform.android) {
-          _initCameraAndPlugin();
-        } else {
-          initWindowsFFI();
-        }
+        _cameraBridge.initCamera(this);
       }
     }
   }
 
-  Future<void> initWindowsFFI() async {
-    final state = Provider.of<SibiState>(context, listen: false);
-    setState(() => _isCameraInitializing = true);
-    state.setCameraActive(false, message: 'Memulai Sistem...');
-
-    try {
-      // Alokasikan memori pointer C++ (10MB cukup untuk gambar JPEG Full HD)
-      _ffiImageBuffer = malloc.allocate<ffi.Uint8>(10 * 1024 * 1024);
-      _ffiImageSizePtr = malloc.allocate<ffi.Int32>(4);
-      _ffiLandmarksPtr = malloc.allocate<ffi.Float>(126 * 4);
-      _ffiPredIndexPtr = malloc.allocate<ffi.Int32>(4);
-      _ffiPredConfidencePtr = malloc.allocate<ffi.Float>(4);
-
-      _ffi = SibiVisionFFI();
-
-      // Cari model di folder flutter_assets
-      final exePath = Platform.resolvedExecutable;
-      final exeDir = File(exePath).parent.path;
-      final modelPath = "$exeDir\\data\\flutter_assets\\assets\\hand_landmarker.task";
-      final classifierPath = "$exeDir\\data\\flutter_assets\\assets\\sibi_classifier.tflite";
-
-      debugPrint("Memuat model MediaPipe FFI Windows: $modelPath");
-      debugPrint("Memuat model TFLite Classifier Windows: $classifierPath");
-
-      final success = _ffi!.init(
-        modelPath: modelPath,
-        classifierPath: classifierPath,
-        numHands: 2,
-      );
-      if (!success) {
-        state.setCameraActive(false, message: 'Gagal memuat model MediaPipe FFI.');
-        setState(() => _isCameraInitializing = false);
-        return;
-      }
-
-      state.setBridgeConnected(true);
-      state.setCameraActive(true, message: 'Sistem Aktif');
-
-      // Mulai timer untuk memproses frame
-      _ffiTimer = Timer.periodic(const Duration(milliseconds: 30), (_) => _processFfiFrame());
-    } catch (e) {
-      debugPrint("Gagal menginisialisasi FFI Windows: $e");
-      state.setCameraActive(false, message: 'Gagal mendeteksi kamera Windows.');
-    } finally {
-      setState(() => _isCameraInitializing = false);
-    }
+  @override
+  void dispose() {
+    _sibiState.removeListener(_onStateChanged);
+    _cameraBridge.disposeCamera(this);
+    super.dispose();
   }
 
-  void _processFfiFrame() {
-    if (_ffi == null || _isFfiProcessing || !mounted) return;
-    final state = Provider.of<SibiState>(context, listen: false);
-    if (state.isPaused) return;
-
-    _isFfiProcessing = true;
-
-    try {
-      final detectedCount = _ffi!.process(
-        outImageDataPtr: _ffiImageBuffer!,
-        outImageSizePtr: _ffiImageSizePtr!,
-        outLandmarksPtr: _ffiLandmarksPtr!,
-        outPredIndexPtr: _ffiPredIndexPtr!,
-        outPredConfidencePtr: _ffiPredConfidencePtr!,
-        maxHands: 2,
-      );
-
-      if (detectedCount < 0) {
-        // Frame kosong atau error kamera
-        _isFfiProcessing = false;
-        return;
-      }
-
-      _calculateFps();
-
-      // Ambil ukuran JPEG dan salin bytes
-      final jpegSize = _ffiImageSizePtr!.value;
-      if (jpegSize > 0) {
-        final jpegBytes = _ffiImageBuffer!.asTypedList(jpegSize);
-        final Uint8List frameBytes = Uint8List.fromList(jpegBytes);
-        state.updateStreamedImage(frameBytes);
-      }
-
-      // Ambil koordinat landmark
-      final List<AppHand> detectedHands = [];
-      if (detectedCount > 0) {
-        final landmarksList = _ffiLandmarksPtr!.asTypedList(2 * 21 * 3);
-        
-        for (int i = 0; i < detectedCount; ++i) {
-          final List<AppLandmark> lms = [];
-          for (int j = 0; j < 21; ++j) {
-            int baseIdx = (i * 21 + j) * 3;
-            lms.add(AppLandmark(
-              x: landmarksList[baseIdx].toDouble(),
-              y: landmarksList[baseIdx + 1].toDouble(),
-              z: landmarksList[baseIdx + 2].toDouble(),
-            ));
-          }
-          detectedHands.add(AppHand(landmarks: lms));
-        }
-      }
-
-      state.updateDetectedHands(detectedHands);
-
-      // Jalankan klasifikasi model secara native
-      final startTime = DateTime.now();
-      
-      String label = 'Menunggu Gesture...';
-      double confidence = 0.0;
-      final predIndex = _ffiPredIndexPtr!.value;
-      final predConfidence = _ffiPredConfidencePtr!.value;
-      
-      if (detectedCount > 0 && predIndex >= 0) {
-        label = widget.classifier.getLabelFromIndex(predIndex);
-        confidence = predConfidence;
-      }
-
-      final endTime = DateTime.now();
-      final inferenceTimeMs = (endTime.difference(startTime).inMicroseconds) / 1000.0;
-
-      state.updatePerformanceMetrics(
-        fps: _currentCalculatedFps > 0 ? _currentCalculatedFps : 30.0,
-        inferenceTimeMs: inferenceTimeMs,
-        latencyMs: inferenceTimeMs + 5.0,
-        confidence: confidence,
-      );
-
-      _processDebouncedPrediction(label);
-    } catch (e) {
-      debugPrint("Error memproses frame FFI Windows: $e");
-    } finally {
-      _isFfiProcessing = false;
-    }
+  // Method publik untuk diakses oleh Native/Web Bridge guna mengatur status loading kamera
+  void setInitializing(bool val) {
+    if (!mounted) return;
+    setState(() => _isCameraInitializing = val);
   }
 
-  void _disposeWindowsFFI() {
-    _ffiTimer?.cancel();
-    _ffiTimer = null;
-    
-    _ffi?.close();
-    _ffi = null;
-
-    if (_ffiImageBuffer != null) {
-      malloc.free(_ffiImageBuffer!);
-      _ffiImageBuffer = null;
-    }
-    if (_ffiImageSizePtr != null) {
-      malloc.free(_ffiImageSizePtr!);
-      _ffiImageSizePtr = null;
-    }
-    if (_ffiLandmarksPtr != null) {
-      malloc.free(_ffiLandmarksPtr!);
-      _ffiLandmarksPtr = null;
-    }
-    if (_ffiPredIndexPtr != null) {
-      malloc.free(_ffiPredIndexPtr!);
-      _ffiPredIndexPtr = null;
-    }
-    if (_ffiPredConfidencePtr != null) {
-      malloc.free(_ffiPredConfidencePtr!);
-      _ffiPredConfidencePtr = null;
-    }
-
-    final state = Provider.of<SibiState>(context, listen: false);
-    state.setBridgeConnected(false);
-    state.updateStreamedImage(null);
-    state.updateDetectedHands([]);
-    state.setCameraActive(false, message: 'Sistem dimatikan.');
-  }
-
-  Future<void> _initCameraAndPlugin() async {
-    final state = Provider.of<SibiState>(context, listen: false);
-
-    setState(() => _isCameraInitializing = true);
-    state.setCameraActive(false, message: 'Memulai Sistem...');
-
-    try {
-      if (_cachedCameras == null || _cachedCameras!.isEmpty) {
-        _cachedCameras = await availableCameras();
-      }
-      final cameras = _cachedCameras!;
-      if (cameras.isEmpty) {
-        state.setCameraActive(false, message: 'Perangkat tidak ditemukan.', permissionDenied: false);
-        setState(() => _isCameraInitializing = false);
-        return;
-      }
-
-      // Cari kamera sesuai arah preferensi (depan/belakang), jika tidak ada pakai yang tersedia
-      final camera = cameras.firstWhere(
-        (cam) => cam.lensDirection == _preferredLensDirection,
-        orElse: () => cameras.first,
-      );
-      
-      // Update preferensi dengan yang sebenarnya didapat
-      _preferredLensDirection = camera.lensDirection;
-
-      _controller = CameraController(
-        camera,
-        ResolutionPreset.medium,
-        enableAudio: false,
-        imageFormatGroup: defaultTargetPlatform == TargetPlatform.android
-            ? ImageFormatGroup.yuv420
-            : null,
-      );
-
-      try {
-        await _controller!.initialize();
-      } catch (e) {
-        debugPrint('Camera initialization failed: $e');
-        if (mounted) {
-          state.setCameraActive(false, message: 'Kamera gagal diakses. Coba turunkan resolusi atau gunakan kamera lain.', permissionDenied: true);
-          setState(() => _isCameraInitializing = false);
-        }
-        return;
-      }
-
-      // Hanya inisialisasi MediaPipe jika berjalan di platform Android
-      final isAndroid = defaultTargetPlatform == TargetPlatform.android;
-      
-      if (isAndroid) {
-        try {
-          if (_landmarkerPlugin == null) {
-            _landmarkerPlugin = mp.HandLandmarkerPlugin.create(
-              numHands: 2,
-              minHandDetectionConfidence: 0.7,
-              delegate: mp.HandLandmarkerDelegate.gpu,
-            );
-
-            // Listen ke hasil stream koordinat hand landmarks dari MediaPipe native
-            _landmarkSubscription = _landmarkerPlugin!.landmarkStream.listen(_onLandmarksDetected);
-          }
-          
-          // Mulai aliran frame kamera secara asinkron dengan pembatasan frame rate
-          await _controller!.startImageStream((CameraImage image) {
-            if (!_isStreamProcessing && _landmarkerPlugin != null && _controller != null) {
-              _isStreamProcessing = true;
-              try {
-                _landmarkerPlugin!.processFrame(
-                  image,
-                  _controller!.description.sensorOrientation,
-                );
-              } catch (e) {
-                debugPrint('Error memproses frame kamera: $e');
-                _isStreamProcessing = false;
-              }
-            }
-          });
-        } catch (mlErr) {
-          debugPrint('Gagal menginisialisasi MediaPipe native: $mlErr');
-          if (mounted) {
-            state.setModelStatus(false, message: 'Gagal inisialisasi MediaPipe. Silakan gunakan Mode Simulator.');
-          }
-        }
-      }
-
-      // Beri jeda sejenak agar UI sempat me-render frame pertama kamera
-      // sebelum memblokir thread untuk memuat model MediaPipe yang berat
-      await Future.delayed(const Duration(milliseconds: 250));
-
-      if (mounted) {
-        state.setCameraActive(true, message: 'Sistem Aktif');
-        setState(() => _isCameraInitializing = false);
-      }
-    } catch (e) {
-      debugPrint('Error inisialisasi kamera: $e');
-      if (mounted) {
-        state.setCameraActive(false, message: 'Gagal mengakses kamera. Pastikan izin telah diberikan.', permissionDenied: true);
-        setState(() => _isCameraInitializing = false);
-      }
-    }
-  }
-
-  /// Callback saat landmark tangan terdeteksi dari MediaPipe stream (Android Only)
-  void _onLandmarksDetected(List<mp.Hand> hands) {
+  // Callback terpadu saat prediksi gerakan berhasil diperoleh (dari FFI / Android Stream)
+  void onPredictionResult(CameraPrediction prediction) {
     if (!mounted) return;
     final state = Provider.of<SibiState>(context, listen: false);
-    
-    if (state.isPaused) {
-      _isStreamProcessing = false;
-      return;
+
+    // Update data landmark tangan yang terdeteksi
+    state.updateDetectedHands(prediction.hands);
+
+    // Hitung kecepatan bingkai (FPS)
+    _calculateFps();
+
+    // Perbarui metrik performa di SibiState
+    state.updatePerformanceMetrics(
+      fps: _currentCalculatedFps > 0 ? _currentCalculatedFps : 30.0,
+      inferenceTimeMs: prediction.inferenceTimeMs,
+      latencyMs: prediction.inferenceTimeMs + 5.0,
+      confidence: prediction.confidence,
+    );
+
+    // Update frame gambar Windows jika disediakan (Windows Only)
+    if (prediction.imageBytes != null) {
+      state.updateStreamedImage(prediction.imageBytes);
     }
 
-    try {
-      // Hitung FPS Kamera/Inference
-      _calculateFps();
+    // PENTING: Jalankan AI Inference di Main Isolate dengan mode yang dipilih (Auto / Alphabet / Word)
+    final result = widget.classifier.classify(prediction.hands, mode: state.translationMode);
 
-      if (hands.isEmpty) {
-        state.updateDetectedHands([]);
-        // Reset buffer pengetikan jika tangan hilang dari layar
-        _currentBufferChar = '';
-        _bufferStartTime = null;
-        return;
-      }
+    // Update status mesin aktif di SibiState ("Huruf", "Kata", atau "Menunggu")
+    if (result.inferenceSource.contains('Kata')) {
+      state.updateActiveEngine('Kata');
+    } else if (result.inferenceSource.contains('Huruf')) {
+      state.updateActiveEngine('Huruf');
+    } else {
+      state.updateActiveEngine('Menunggu');
+    }
 
-      // Map model landmark dari plugin ke model terpadu kita dengan menyesuaikan rotasi/cermin ke koordinat layar
-      final appHands = hands.map((mpHand) {
-        final appLms = mpHand.landmarks.map((lm) {
-          double xMapped = lm.x;
-          double yMapped = lm.y;
+    if (_lastLiveLabel != result.label) {
+      setState(() {
+        _lastLiveLabel = result.label;
+        if (result.label != 'Menunggu Gesture...' && result.label != '?') {
+          _lastLiveDisplay = '${result.label} (${(result.confidence * 100).toInt()}%)';
+        } else {
+          _lastLiveDisplay = result.label;
+        }
+      });
+    }
 
-          if (defaultTargetPlatform == TargetPlatform.android && _controller != null) {
-            final isFront = _controller!.description.lensDirection == CameraLensDirection.front;
-            final orientation = _controller!.description.sensorOrientation;
+    // Proses hasil terjemahan dengan debouncer pengetikan kata/huruf
+    _processDebouncedPrediction(result.label);
+  }
 
-            if (isFront) {
-              // Kamera Depan (Mirrored)
-              if (orientation == 270) {
-                xMapped = 1.0 - lm.y;
-                yMapped = 1.0 - lm.x;
-              } else if (orientation == 90) {
-                xMapped = lm.y;
-                yMapped = lm.x;
-              } else if (orientation == 0) {
-                xMapped = 1.0 - lm.x;
-                yMapped = lm.y;
-              } else if (orientation == 180) {
-                xMapped = lm.x;
-                yMapped = 1.0 - lm.y;
-              }
-            } else {
-              // Kamera Belakang (Not Mirrored)
-              if (orientation == 270) {
-                xMapped = lm.y;
-                yMapped = 1.0 - lm.x;
-              } else if (orientation == 90) {
-                xMapped = 1.0 - lm.y;
-                yMapped = lm.x;
-              } else if (orientation == 0) {
-                xMapped = 1.0 - lm.x;
-                yMapped = lm.y;
-              } else if (orientation == 180) {
-                xMapped = lm.x;
-                yMapped = 1.0 - lm.y;
-              }
-            }
-          }
-          return AppLandmark(x: xMapped, y: yMapped, z: lm.z);
-        }).toList();
-        return AppHand(landmarks: appLms);
-      }).toList();
+  // Method public untuk memulai & mematikan kamera dari luar
+  void startCamera() => _cameraBridge.initCamera(this);
+  void stopCamera() => _cameraBridge.disposeCamera(this);
+  void toggleCamera() => _cameraBridge.toggleCamera(this);
+  bool get canToggleCamera => !kIsWeb && (defaultTargetPlatform == TargetPlatform.android || defaultTargetPlatform == TargetPlatform.iOS);
 
-      state.updateDetectedHands(appHands);
-
-      // Jalankan klasifikasi model
-      final startTime = DateTime.now();
-      final classificationResult = widget.classifier.classify(appHands);
-      final endTime = DateTime.now();
-
-      final inferenceTimeMs = (endTime.difference(startTime).inMicroseconds) / 1000.0;
-
-      // Update metrik ke state manager
-      state.updatePerformanceMetrics(
-        fps: _currentCalculatedFps > 0 ? _currentCalculatedFps : 25.0,
-        inferenceTimeMs: inferenceTimeMs,
-        latencyMs: inferenceTimeMs + 8.0, // Estimasi overhead buffer
-        confidence: classificationResult.confidence,
-      );
-
-      // Proses hasil prediksi dengan debouncer
-      _processDebouncedPrediction(classificationResult.label);
-    } finally {
-      _isStreamProcessing = false;
+  /// Menghitung FPS (Frames Per Second) dari pemrosesan gambar kamera
+  void _calculateFps() {
+    _fpsFrameCount++;
+    final now = DateTime.now();
+    _fpsStartTime ??= now;
+    
+    final diff = now.difference(_fpsStartTime!).inMilliseconds;
+    if (diff >= 1000) {
+      setState(() {
+        _currentCalculatedFps = (_fpsFrameCount * 1000.0) / diff;
+        _fpsFrameCount = 0;
+        _fpsStartTime = now;
+      });
     }
   }
 
   /// Algoritma Debouncing Pengetikan Kata/Huruf Real-time
   void _processDebouncedPrediction(String label) {
-    if (label == 'Menunggu Gesture...' || label == '?') {
+    // Saring semua status idle/menunggu agar TIDAK masuk ke kotak hasil pengetikan
+    if (label.isEmpty || 
+        label.startsWith('Menunggu') || 
+        label == '?' || 
+        label == 'Menunggu Gesture...') {
       _bufferStartTime = null;
       _currentBufferChar = '';
+      _lastEmittedChar = ''; // Reset state emit ketika tidak ada gesture
+      return;
+    }
+
+    // Hindari spam: Jangan proses jika kata/huruf yang sama baru saja diketik, 
+    // kecuali pengguna menurunkan tangan atau merubah gesture terlebih dahulu.
+    if (label == _lastEmittedChar) {
       return;
     }
 
@@ -478,28 +183,21 @@ class CameraViewState extends State<CameraView> {
       // Label sama sedang ditahan
       final elapsed = DateTime.now().difference(_bufferStartTime!);
       if (elapsed >= _debounceThreshold) {
-        // Cek jika huruf/kata ini berbeda dengan huruf terakhir yang diketik
-        // atau jika berupa kata penuh (sehingga boleh diketik berurutan)
         final isWord = label.length > 1;
         
         if (isWord) {
           state.appendWord(label);
-          // Mainkan feedback getar ringan jika didukung
           _triggerHapticFeedback();
-          // Reset buffer
-          _currentBufferChar = '';
-          _bufferStartTime = null;
         } else {
-          // Hanya ketik jika berbeda dengan huruf terakhir di ujung teks
-          final currentText = state.translatedText;
-          if (currentText.isEmpty || !currentText.endsWith(label)) {
-            state.appendLetter(label);
-            _triggerHapticFeedback();
-          }
-          // Reset buffer agar tidak mengetik huruf yang sama berulang-ulang tanpa jeda
-          _currentBufferChar = '';
-          _bufferStartTime = null;
+          state.appendLetter(label);
+          _triggerHapticFeedback();
         }
+        
+        // Simpan sebagai huruf/kata terakhir yang diketik untuk mencegah spam
+        _lastEmittedChar = label;
+        // Reset buffer
+        _currentBufferChar = '';
+        _bufferStartTime = null;
       }
     } else {
       // Label baru terdeteksi, mulai hitung waktu buffer baru
@@ -509,72 +207,16 @@ class CameraViewState extends State<CameraView> {
   }
 
   void _triggerHapticFeedback() {
-    // Memberikan sentuhan getar lembut (mock/platform feedback)
-    kIsWeb ? null : SystemSound.play(SystemSoundType.click);
-  }
-
-  void _calculateFps() {
-    _fpsFrameCount++;
-    final now = DateTime.now();
-    _fpsStartTime ??= now;
-
-    final diff = now.difference(_fpsStartTime!);
-    if (diff.inSeconds >= 1) {
-      _currentCalculatedFps = _fpsFrameCount / (diff.inMilliseconds / 1000.0);
-      _fpsFrameCount = 0;
-      _fpsStartTime = now;
+    if (!kIsWeb) {
+      SystemSound.play(SystemSoundType.click);
     }
-  }
-
-  Future<void> _disposeCamera({bool disposePlugin = false}) async {
-    _isStreamProcessing = false;
-    
-    if (disposePlugin) {
-      _landmarkSubscription?.cancel();
-      _landmarkSubscription = null;
-      _landmarkerPlugin?.dispose();
-      _landmarkerPlugin = null;
-    }
-    
-    if (_controller != null) {
-      try {
-        if (_controller!.value.isStreamingImages) {
-          await _controller!.stopImageStream();
-          await Future.delayed(const Duration(milliseconds: 150)); // Jeda 150ms agar native stream bersih
-        }
-      } catch (_) {}
-      try {
-        await _controller!.dispose();
-      } catch (_) {}
-      _controller = null;
-    }
-  }
-
-  Future<void> _toggleCameraLens() async {
-    if (_isCameraInitializing) return;
-    
-    setState(() {
-      _preferredLensDirection = _preferredLensDirection == CameraLensDirection.front 
-          ? CameraLensDirection.back 
-          : CameraLensDirection.front;
-    });
-    
-    await _disposeCamera(disposePlugin: false);
-    _initCameraAndPlugin();
-  }
-
-  @override
-  void dispose() {
-    _sibiState.removeListener(_onStateChanged);
-    _disposeCamera(disposePlugin: true);
-    _disposeWindowsFFI();
-    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final state = Provider.of<SibiState>(context);
 
+    // 1. Tampilan ketika kamera dinonaktifkan atau dijeda
     if (state.isPaused) {
       return Container(
         color: Colors.transparent,
@@ -603,134 +245,28 @@ class CameraViewState extends State<CameraView> {
       );
     }
 
-    final isWindows = defaultTargetPlatform == TargetPlatform.windows;
-    
-    if (isWindows) {
-      if (state.isBridgeConnected && state.streamedImageBytes != null) {
-        return Container(
-          clipBehavior: Clip.antiAlias,
-          decoration: BoxDecoration(
-            color: Colors.black,
-            borderRadius: BorderRadius.circular(14),
-          ),
-          child: Stack(
-            fit: StackFit.expand,
+    // 2. Tampilkan Loading Spinner saat kamera sedang diinisialisasi (hanya untuk Native)
+    if (_isCameraInitializing && !kIsWeb) {
+      return Container(
+        color: Colors.transparent,
+        child: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Positioned.fill(
-                child: Image.memory(
-                  state.streamedImageBytes!,
-                  gaplessPlayback: true,
-                  fit: BoxFit.cover,
-                ),
-              ),
-              Positioned.fill(
-                child: CustomPaint(
-                  painter: LandmarkPainter(
-                    hands: state.detectedHands,
-                    previewSize: const Size(640, 480),
-                    lensDirection: CameraLensDirection.front,
-                    sensorOrientation: 0,
-                  ),
-                ),
-              ),
-              Positioned(
-                top: 16,
-                left: 16,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: Colors.black.withOpacity(0.6),
-                    borderRadius: BorderRadius.circular(30),
-                    border: Border.all(color: AppTheme.glassBorder, width: 0.8),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Container(
-                        width: 8,
-                        height: 8,
-                        decoration: const BoxDecoration(
-                          color: AppTheme.successEmerald,
-                          shape: BoxShape.circle,
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Text(
-                        'KAMERA AKTIF',
-                        style: GoogleFonts.outfit(
-                          fontSize: 10,
-                          fontWeight: FontWeight.bold,
-                          color: AppTheme.textPrimary,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
+              const CircularProgressIndicator(color: AppTheme.successEmerald),
+              const SizedBox(height: 16),
+              Text(
+                state.cameraStatusMessage.isNotEmpty ? state.cameraStatusMessage : 'Memulai Sistem...',
+                style: const TextStyle(color: AppTheme.textPrimary, fontWeight: FontWeight.bold),
               ),
             ],
           ),
-        );
-      } else {
-        if (_isCameraInitializing || (state.isBridgeConnected && state.streamedImageBytes == null)) {
-          return Container(
-            color: Colors.transparent,
-            child: Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const CircularProgressIndicator(color: AppTheme.successEmerald),
-                  const SizedBox(height: 16),
-                  Text(
-                    state.cameraStatusMessage.isNotEmpty ? state.cameraStatusMessage : 'Memulai Sistem...',
-                    style: const TextStyle(color: AppTheme.textPrimary, fontWeight: FontWeight.bold),
-                  ),
-                ],
-              ),
-            ),
-          );
-        }
-
-        return Container(
-          padding: const EdgeInsets.all(24),
-          color: Colors.transparent,
-          child: Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Icon(Icons.videocam_off_rounded, size: 64, color: AppTheme.textSecondary),
-                const SizedBox(height: 16),
-                Text(
-                  'Kamera Mati',
-                  style: GoogleFonts.outfit(
-                    fontSize: 24,
-                    fontWeight: FontWeight.bold,
-                    color: AppTheme.textPrimary,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                const Text(
-                  'Tekan tombol START hijau di bawah untuk menghidupkan kamera',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(color: AppTheme.textSecondary),
-                ),
-              ],
-            ),
-          ),
-        );
-      }
-    }
-
-    if (_isCameraInitializing) {
-      return Container(
-        color: Colors.transparent,
-        height: double.infinity,
-        child: const Center(
-          child: CircularProgressIndicator(color: AppTheme.electricIndigo),
         ),
       );
     }
 
-    if (!state.isCameraActive || _controller == null || !_controller!.value.isInitialized) {
+    // 3. Tampilkan Pesan Kesalahan jika kamera gagal diakses (hanya untuk Native)
+    if (!state.isCameraActive && !kIsWeb) {
       return Container(
         padding: const EdgeInsets.all(24),
         color: Colors.transparent,
@@ -738,24 +274,17 @@ class CameraViewState extends State<CameraView> {
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              const Icon(Icons.videocam_off_rounded, size: 64, color: AppTheme.dangerRose),
+              const Icon(Icons.videocam_off_rounded, size: 64, color: Colors.white54),
               const SizedBox(height: 16),
               Text(
-                'Sensor Kamera Tidak Tersedia',
-                style: Theme.of(context).textTheme.titleLarge?.copyWith(color: AppTheme.dangerRose),
+                'Kamera Mati',
+                style: Theme.of(context).textTheme.titleLarge?.copyWith(color: Colors.white70),
               ),
               const SizedBox(height: 12),
-              Text(
-                state.cameraStatusMessage,
+              const Text(
+                'Klik tombol START di bawah untuk mulai dan menyalakan kamera.',
                 textAlign: TextAlign.center,
-                style: const TextStyle(color: AppTheme.textSecondary),
-              ),
-              const SizedBox(height: 24),
-              ElevatedButton.icon(
-                onPressed: _initCameraAndPlugin,
-                icon: const Icon(Icons.refresh_rounded),
-                label: const Text('Coba Lagi'),
-                style: ElevatedButton.styleFrom(backgroundColor: AppTheme.surfaceDark),
+                style: TextStyle(color: AppTheme.textSecondary),
               ),
             ],
           ),
@@ -763,11 +292,7 @@ class CameraViewState extends State<CameraView> {
       );
     }
 
-    // Kamera berhasil aktif
-    final controller = _controller!;
-    final previewSize = controller.value.previewSize!;
-    final previewAspectRatio = previewSize.height / previewSize.width;
-
+    // 4. Kamera berhasil aktif: Tampilkan pratinjau kamera sesuai platform
     return Container(
       clipBehavior: Clip.antiAlias,
       decoration: BoxDecoration(
@@ -777,28 +302,49 @@ class CameraViewState extends State<CameraView> {
       child: Stack(
         fit: StackFit.expand,
         children: [
-          // 1. Camera Preview & 3. Custom Painter Overlay
-          Center(
-            child: AspectRatio(
-              aspectRatio: previewAspectRatio,
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  CameraPreview(controller),
-                  CustomPaint(
-                    painter: LandmarkPainter(
-                      hands: state.detectedHands,
-                      previewSize: previewSize,
-                      lensDirection: controller.description.lensDirection,
-                      sensorOrientation: controller.description.sensorOrientation,
+          // Render penampang kamera statis dari bridge (Windows, Android, Web)
+          _cameraBridge.buildPreview(context, this),
+          
+          // Khusus Web: Tampilkan loading atau error overlay di atas HtmlElementView jika kamera belum aktif/sedang loading
+          if (kIsWeb && (!state.isCameraActive || _isCameraInitializing))
+            Positioned.fill(
+              child: Container(
+                color: Colors.black,
+                child: Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24.0),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        if (_isCameraInitializing) ...[
+                          const CircularProgressIndicator(color: AppTheme.successEmerald),
+                          const SizedBox(height: 16),
+                          Text(
+                            state.cameraStatusMessage.isNotEmpty ? state.cameraStatusMessage : 'Memulai Sistem...',
+                            style: const TextStyle(color: AppTheme.textPrimary, fontWeight: FontWeight.bold),
+                          ),
+                        ] else ...[
+                          const Icon(Icons.videocam_off_rounded, size: 64, color: Colors.white54),
+                          const SizedBox(height: 16),
+                          Text(
+                            'Kamera Mati',
+                            style: Theme.of(context).textTheme.titleLarge?.copyWith(color: Colors.white70),
+                          ),
+                          const SizedBox(height: 12),
+                          const Text(
+                            'Klik tombol START di bawah untuk mulai dan menyalakan kamera.',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(color: AppTheme.textSecondary),
+                          ),
+                        ],
+                      ],
                     ),
                   ),
-                ],
+                ),
               ),
             ),
-          ),
           
-          // 2. Corner Brackets (Siku Pembatas)
+          // Siku Pembatas (Corner Brackets) overlay
           Positioned.fill(
             child: CustomPaint(
               painter: CornerBracketsPainter(
@@ -809,10 +355,10 @@ class CameraViewState extends State<CameraView> {
             ),
           ),
 
-          // 4. Status Badge Overlay
+          // Status Badge overlay
           Positioned(
-            top: 16,
-            left: 16,
+            top: 12,
+            left: 12,
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
               decoration: BoxDecoration(
@@ -845,29 +391,89 @@ class CameraViewState extends State<CameraView> {
             ),
           ),
 
+          // Live Prediction Overlay Badge & Label Kecil Mode Mesin ("Huruf" / "Kata")
+          Positioned(
+            bottom: 16,
+            left: 16,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Label Kecil "Huruf" / "Kata"
+                Consumer<SibiState>(
+                  builder: (context, state, _) {
+                    final String engine = state.currentActiveEngine;
+                    final bool isWord = engine == 'Kata';
+                    final bool isLetter = engine == 'Huruf';
+                    final Color badgeColor = isWord 
+                        ? const Color(0xFFF59E0B) // Amber untuk Kata
+                        : (isLetter ? const Color(0xFF10B981) : Colors.grey); // Emerald untuk Huruf
 
-          // 6. Tombol Balik Kamera (Hanya untuk Mobile)
-          if (!isWindows)
-            Positioned(
-              top: 16,
-              right: 72,
-              child: Material(
-                color: Colors.black.withOpacity(0.5),
-                shape: const CircleBorder(),
-                child: IconButton(
-                  icon: const Icon(Icons.flip_camera_android_rounded, color: Colors.white),
-                  tooltip: 'Balik Kamera',
-                  onPressed: _toggleCameraLens,
+                    return Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withOpacity(0.8),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: badgeColor.withOpacity(0.6), width: 1.0),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            isWord ? Icons.waves_rounded : (isLetter ? Icons.text_fields_rounded : Icons.hourglass_empty_rounded),
+                            color: badgeColor,
+                            size: 13,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            engine.toUpperCase(),
+                            style: GoogleFonts.outfit(
+                              fontSize: 10,
+                              fontWeight: FontWeight.w800,
+                              color: badgeColor,
+                              letterSpacing: 0.5,
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
                 ),
-              ),
+                const SizedBox(width: 8),
+
+                // Hasil Deteksi Real-Time AI
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.75),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: AppTheme.electricCyan.withOpacity(0.4), width: 1.0),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.psychology_rounded, color: AppTheme.electricCyan, size: 14),
+                      const SizedBox(width: 6),
+                      Text(
+                        _lastLiveLabel.isNotEmpty ? 'AI: $_lastLiveLabel' : 'AI: Menunggu...',
+                        style: GoogleFonts.outfit(
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                          color: AppTheme.electricCyan,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
             ),
+          ),
         ],
       ),
     );
   }
 }
 
-/// CustomPainter untuk melukis 21 landmark tangan dan garis penghubungnya
+/// CustomPainter untuk melukis 21 landmark tangan dan garis penghubungnya (Hanya untuk Mobile/Desktop Native)
 class LandmarkPainter extends CustomPainter {
   final List<AppHand> hands;
   final Size previewSize;
@@ -885,28 +491,24 @@ class LandmarkPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     if (hands.isEmpty) return;
 
-    // Paint untuk titik Landmark
     final nodePaint = Paint()
       ..color = AppTheme.electricCyan
       ..style = PaintingStyle.fill;
 
-    // Paint untuk garis sendi
     final linePaint = Paint()
       ..color = AppTheme.electricIndigo.withOpacity(0.8)
       ..strokeWidth = 3.0
       ..style = PaintingStyle.stroke;
 
-    // Struktur koneksi antar landmark tangan MediaPipe (21 titik)
     const connections = [
-      [0, 1], [1, 2], [2, 3], [3, 4], // Jempol
-      [0, 5], [5, 6], [6, 7], [7, 8], // Telunjuk
-      [5, 9], [9, 10], [10, 11], [11, 12], // Tengah
-      [9, 13], [13, 14], [14, 15], [15, 16], // Manis
-      [13, 17], [0, 17], [17, 18], [18, 19], [19, 20], // Kelingking
+      [0, 1], [1, 2], [2, 3], [3, 4],
+      [0, 5], [5, 6], [6, 7], [7, 8],
+      [5, 9], [9, 10], [10, 11], [11, 12],
+      [9, 13], [13, 14], [14, 15], [15, 16],
+      [13, 17], [0, 17], [17, 18], [18, 19], [19, 20],
     ];
 
     for (final hand in hands) {
-      // 1. Gambar Garis Penghubung Sendi
       for (final connection in connections) {
         final start = hand.landmarks[connection[0]];
         final end = hand.landmarks[connection[1]];
@@ -923,17 +525,15 @@ class LandmarkPainter extends CustomPainter {
         );
       }
 
-      // 2. Gambar Titik Landmark
       for (int i = 0; i < hand.landmarks.length; i++) {
         final landmark = hand.landmarks[i];
         final dx = landmark.x * size.width;
         final dy = landmark.y * size.height;
 
-        // Beri warna khusus pada ujung jari untuk estetika
         if (i == 4 || i == 8 || i == 12 || i == 16 || i == 20) {
           nodePaint.color = AppTheme.neonPurple;
         } else if (i == 0) {
-          nodePaint.color = AppTheme.successEmerald; // Pergelangan tangan
+          nodePaint.color = AppTheme.successEmerald;
         } else {
           nodePaint.color = AppTheme.electricCyan;
         }
@@ -947,7 +547,7 @@ class LandmarkPainter extends CustomPainter {
   bool shouldRepaint(covariant LandmarkPainter oldDelegate) => true;
 }
 
-/// CustomPainter untuk melukis kurung sudut pembatas (Corner brackets) seperti pada desain mockup
+/// CustomPainter untuk melukis siku pembatas kurung sudut
 class CornerBracketsPainter extends CustomPainter {
   final Color color;
   final double bracketLength;
@@ -965,12 +565,11 @@ class CornerBracketsPainter extends CustomPainter {
       ..color = color
       ..style = PaintingStyle.stroke
       ..strokeWidth = strokeWidth
-      ..strokeCap = StrokeCap.square; // Sudut lancip rata
+      ..strokeCap = StrokeCap.square;
 
     final w = size.width;
     final h = size.height;
 
-    // Kiri Atas
     canvas.drawPath(
       Path()
         ..moveTo(0, bracketLength)
@@ -979,7 +578,6 @@ class CornerBracketsPainter extends CustomPainter {
       paint,
     );
 
-    // Kanan Atas
     canvas.drawPath(
       Path()
         ..moveTo(w - bracketLength, 0)
@@ -988,7 +586,6 @@ class CornerBracketsPainter extends CustomPainter {
       paint,
     );
 
-    // Kiri Bawah
     canvas.drawPath(
       Path()
         ..moveTo(0, h - bracketLength)
@@ -997,7 +594,6 @@ class CornerBracketsPainter extends CustomPainter {
       paint,
     );
 
-    // Kanan Bawah
     canvas.drawPath(
       Path()
         ..moveTo(w - bracketLength, h)

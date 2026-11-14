@@ -38,11 +38,12 @@ dependencies:
   permission_handler: ^12.0.3
   google_fonts: ^8.1.0
   provider: ^6.1.5+1
-  tflite_flutter: ^0.12.1
   hand_landmarker: ^3.0.0
   camera_windows: ^0.2.6+4
   window_manager: ^0.5.2
   ffi: ^2.1.2
+  web: ^1.1.1
+  flutter_litert: ^3.9.3
 
 dev_dependencies:
   flutter_test:
@@ -67,9 +68,14 @@ flutter:
   uses-material-design: true
 
   assets:
-    - assets/sibi_classifier.tflite
+    - assets/sibi_alphabet_quantized.tflite
+    - assets/alphabet_labels.txt
+    - assets/alphabet_scaler.json
+    - assets/sibi_word_lstm_quantized.tflite
+    - assets/word_labels.txt
+    - assets/word_scaler.json
     - assets/hand_landmarker.task
-    - assets/labels.txt
+    - assets/images/
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

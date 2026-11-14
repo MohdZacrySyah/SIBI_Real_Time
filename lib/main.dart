@@ -4,7 +4,8 @@ import 'package:provider/provider.dart';
 import 'src/state/sibi_state.dart';
 import 'src/ui/dashboard_screen.dart';
 import 'src/ui/theme.dart';
-import 'src/ml/sibi_classifier.dart';
+import 'src/ml/platform_classifier.dart';
+import 'src/ml/classifier_bridge.dart';
 import 'dart:io' show Platform;
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:window_manager/window_manager.dart';
@@ -12,10 +13,12 @@ import 'package:window_manager/window_manager.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   
-  // Kunci orientasi portrait pada perangkat mobile untuk UX kamera yang konsisten
+  // Dukung orientasi layar portrait dan landscape untuk kecocokan perangkat mobile & tablet
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
     DeviceOrientation.portraitDown,
+    DeviceOrientation.landscapeLeft,
+    DeviceOrientation.landscapeRight,
   ]);
 
   if (!kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS)) {
@@ -33,7 +36,7 @@ void main() async {
     });
   }
 
-  final classifier = SibiClassifier();
+  final classifier = createClassifier();
   await classifier.initialize();
 
   runApp(
@@ -47,7 +50,7 @@ void main() async {
 }
 
 class SibiTranslateApp extends StatelessWidget {
-  final SibiClassifier classifier;
+  final PlatformClassifier classifier;
   
   const SibiTranslateApp({super.key, required this.classifier});
 

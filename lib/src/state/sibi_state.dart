@@ -22,6 +22,29 @@ class TranslationRecord {
 }
 
 class SibiState extends ChangeNotifier {
+  // Mode Penerjemah (Auto-Hybrid Default, Cadangan Manual)
+  // 'auto' = Gabungan Otomatis (Default utama skripsi)
+  // 'alphabet' = Khusus Huruf (Cadangan)
+  // 'word' = Khusus Kata (Cadangan)
+  String _translationMode = 'auto';
+  String get translationMode => _translationMode;
+
+  String _currentActiveEngine = 'Menunggu'; // 'Huruf', 'Kata', atau 'Menunggu'
+  String get currentActiveEngine => _currentActiveEngine;
+
+  void setTranslationMode(String mode) {
+    if (_translationMode == mode) return;
+    _translationMode = mode;
+    notifyListeners();
+  }
+
+  void updateActiveEngine(String engine) {
+    if (_currentActiveEngine != engine) {
+      _currentActiveEngine = engine;
+      notifyListeners();
+    }
+  }
+
   // Pengaturan Tema
   bool _isDarkMode = false;
   bool get isDarkMode => _isDarkMode;

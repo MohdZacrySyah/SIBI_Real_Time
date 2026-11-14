@@ -1,168 +1,427 @@
+import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
-import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:flutter_litert/flutter_litert.dart';
 import 'hand_landmark.dart';
+import 'platform_classifier.dart';
 
 /// ============================================================================
-/// STRUKTUR DATA HASH/PREDIKSI MODEL
+/// KELAS UTAMA: SibiClassifier (Intelligent Auto-Hybrid SIBI Translator)
 /// ============================================================================
-class PredictionResult {
-  final String label;            // Label teks hasil penerjemahan (misal: 'A', 'Halo')
-  final double confidence;       // Tingkat kepercayaan hasil prediksi (nilai 0.0 s.d 1.0)
-  final String inferenceSource;  // Sumber inferensi (contoh: 'TFLite Model')
+/// Menyatukan 2 Mesin AI ke dalam 1 Mode Otomatis Tanpa Tombol Switch:
+/// • Mesin 1: Alphabet Fingerspelling DNN (26 Huruf A–Z, statis per-frame [1, 63])
+/// • Mesin 2: Dynamic Word Gestures CNN-LSTM (7 Kata Dasar, temporal 30-frame [1, 30, 63])
+/// • Intelligent Arbiter: Otomatis mendeteksi varians gerak dinamis vs pose statis.
+class SibiClassifier extends PlatformClassifier {
+  // Interpreter Mesin 1: Alphabet Fingerspelling (DNN)
+  Interpreter? _alphabetInterpreter;
+  List<String> _alphabetLabels = [];
+  List<double> _alphabetScalerMean = [];
+  List<double> _alphabetScalerScale = [];
 
-  PredictionResult({
-    required this.label,
-    required this.confidence,
-    required this.inferenceSource,
-  });
-}
+  // Interpreter Mesin 2: Dynamic Word Gestures (CNN-LSTM)
+  Interpreter? _wordInterpreter;
+  List<String> _wordLabels = [];
+  List<double> _wordScalerMean = [];
+  List<double> _wordScalerScale = [];
 
-/// ============================================================================
-/// KELAS UTAMA: SibiClassifier (Pengklasifikasi Isyarat SIBI)
-/// ============================================================================
-class SibiClassifier {
-  Interpreter? _interpreter;       // Runner interpreter TFLite dari paket tflite_flutter
-  bool _isTfliteLoaded = false;    // Status penanda apakah model berhasil dimuat
-  String _lastErrorMessage = '';   // Menyimpan pesan kesalahan jika model gagal dimuat
-  List<String> _dynamicLabels = []; // Daftar label kelas yang dimuat dari berkas labels.txt
+  bool _isTfliteLoaded = false;
+  String _lastErrorMessage = '';
 
+  // Sliding window buffer untuk Mesin 2 (CNN-LSTM 30 Frame)
+  static const int _sequenceLength = 30;
+  final List<List<double>> _slidingWindowWord = [];
+
+  // Smoothing queue untuk Mesin 1 (Majority Voting 5 Frame)
+  static const int _smoothingWindowSize = 5;
+  final List<String> _recentAlphabetLabels = [];
+  int _missingFramesCount = 0;
+
+  // Ambang batas kepercayaan (Thresholds)
+  static const double _wordConfidenceThreshold = 0.65;
+  static const double _alphabetConfidenceThreshold = 0.45;
+  static const double _dynamicMotionThreshold = 0.018; // Ambang varians gerakan dinamis
+
+  // Hysteresis Counters untuk Mencegah Mode Berkedip (Anti-Flicker State Machine)
+  static const int _minFramesToEnterWordMode = 6;  // Butuh 6 frame berturut-turut di atas ambang gerakan
+  static const int _minFramesToExitWordMode = 8;   // Butuh 8 frame berturut-turut stabil untuk kembali ke huruf
+  int _consecutiveHighMotionFrames = 0;
+  int _consecutiveLowMotionFrames = 0;
+  bool _isInDynamicWordMode = false;
+
+  PredictionResult _lastPrediction = PredictionResult(
+    label: 'Menunggu Gesture...',
+    confidence: 0.0,
+    inferenceSource: 'SIBI Auto-Hybrid',
+  );
+
+  @override
   bool get isTfliteLoaded => _isTfliteLoaded;
+
+  @override
   String get lastErrorMessage => _lastErrorMessage;
 
-  /// Memuat model TensorFlow Lite (.tflite) dan daftar label secara asinkron
-  Future<bool> initialize() async {
+  /// Inisialisasi & pemuatan kedua mesin inferensi secara bersamaan
+  @override
+  Future<bool> initialize({String? modelPath, String? labelsPath}) async {
     try {
       if (kIsWeb) {
         _lastErrorMessage = 'TFLite tidak didukung di Web secara default dalam setup ini.';
         return false;
       }
-      
-      // 1. Memuat file biner model TensorFlow Lite dari folder Assets aplikasi
-      // Pada Windows: library eksternal memanggil interpreter native DLL
-      // Pada Android: library memanggil interpreter native shared object (.so)
-      _interpreter = await Interpreter.fromAsset('assets/sibi_classifier.tflite');
-      _isTfliteLoaded = true;
 
-      // 2. Memuat daftar label secara dinamis dari file assets/labels.txt
+      // 1. Inisialisasi Mesin 1: Alphabet Fingerspelling (DNN 26 Huruf)
       try {
-        final labelsData = await rootBundle.loadString('assets/labels.txt');
-        _dynamicLabels = labelsData.split('\n')
-            .map((e) => e.trim())
-            .where((e) => e.isNotEmpty)
-            .toList();
-        debugPrint('Berhasil memuat ${_dynamicLabels.length} label dari assets/labels.txt');
-      } catch (_) {
-        debugPrint('File labels.txt tidak ditemukan, menggunakan label bawaan aplikasi.');
+        if (modelPath != null && modelPath.isNotEmpty && File(modelPath).existsSync()) {
+          _alphabetInterpreter = Interpreter.fromFile(File(modelPath));
+        } else {
+          _alphabetInterpreter = await Interpreter.fromAsset('assets/sibi_alphabet_quantized.tflite');
+        }
+
+        final alphaLabelsData = await rootBundle.loadString('assets/alphabet_labels.txt');
+        _alphabetLabels = alphaLabelsData.split('\n').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+
+        final alphaScalerData = await rootBundle.loadString('assets/alphabet_scaler.json');
+        final Map<String, dynamic> sc1 = json.decode(alphaScalerData);
+        _alphabetScalerMean = (sc1['mean'] as List).map((e) => (e as num).toDouble()).toList();
+        _alphabetScalerScale = (sc1['scale'] as List).map((e) => (e as num).toDouble()).toList();
+        debugPrint('SIBI [Auto-Hybrid]: Model Huruf A-Z berhasil dimuat (${_alphabetLabels.length} kelas).');
+      } catch (e) {
+        debugPrint('SIBI [Auto-Hybrid]: Gagal memuat Model Huruf: $e');
       }
 
-      debugPrint('TFLite SIBI Classifier berhasil dimuat.');
-      return true;
+      // 2. Inisialisasi Mesin 2: Dynamic Word Gestures (CNN-LSTM 7 Kata)
+      try {
+        _wordInterpreter = await Interpreter.fromAsset('assets/sibi_word_lstm_quantized.tflite');
+        final wordLabelsData = await rootBundle.loadString('assets/word_labels.txt');
+        _wordLabels = wordLabelsData.split('\n').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+
+        final wordScalerData = await rootBundle.loadString('assets/word_scaler.json');
+        final Map<String, dynamic> sc2 = json.decode(wordScalerData);
+        _wordScalerMean = (sc2['mean'] as List).map((e) => (e as num).toDouble()).toList();
+        _wordScalerScale = (sc2['scale'] as List).map((e) => (e as num).toDouble()).toList();
+        debugPrint('SIBI [Auto-Hybrid]: Model Kata CNN-LSTM berhasil dimuat (${_wordLabels.length} kata).');
+      } catch (e) {
+        debugPrint('SIBI [Auto-Hybrid]: Gagal memuat Model Kata CNN-LSTM: $e');
+      }
+
+      _isTfliteLoaded = (_alphabetInterpreter != null || _wordInterpreter != null);
+      debugPrint('SIBI Auto-Hybrid: Sistem satu mode cerdas siap digunakan!');
+      return _isTfliteLoaded;
     } catch (e) {
       _isTfliteLoaded = false;
       _lastErrorMessage = e.toString();
-      debugPrint('Gagal memuat TFLite SIBI Classifier: $e');
+      debugPrint('SIBI Gagal Inisialisasi: $e');
       return false;
     }
   }
 
-  /// Melakukan inferensi/klasifikasi gerakan berdasarkan koordinat landmark tangan
-  PredictionResult classify(List<AppHand> hands) {
-    if (_isTfliteLoaded && _interpreter != null) {
-      try {
-        // ---------------------------------------------------------------------
-        // 1. PENYIAPAN BUFFER INPUT MODEL (Format Shape: [1, 126])
-        // Input model adalah vektor baris tunggal berisi 126 nilai float:
-        // - 21 landmark * 3 sumbu (x, y, z) = 63 nilai per tangan
-        // - 2 tangan * 63 nilai = 126 nilai total
-        // ---------------------------------------------------------------------
-        final List<double> flatLandmarks = [];
-        for (int i = 0; i < 2; i++) {
-          if (i < hands.length) {
-            // Jika tangan terdeteksi, tambahkan 63 koordinatnya
-            flatLandmarks.addAll(hands[i].toFlatVector());
-          } else {
-            // Jika tangan tidak terdeteksi, isi dengan nilai 0.0 (zero-padding)
-            flatLandmarks.addAll(List.filled(63, 0.0));
-          }
-        }
-        // Bungkus dalam array 2 dimensi [1, 126] sesuai requirement tensor input
-        final inputBuffer = [flatLandmarks];
-        
-        // ---------------------------------------------------------------------
-        // 2. PENYIAPAN BUFFER OUTPUT MODEL (Format Shape: [1, jumlah_kelas])
-        // Menyimpan nilai probabilitas kecocokan untuk setiap kelas (softmax output)
-        // ---------------------------------------------------------------------
-        final numClasses = _dynamicLabels.isNotEmpty ? _dynamicLabels.length : 30;
-        final outputBuffer = List.filled(1 * numClasses, 0.0).reshape([1, numClasses]);
-        
-        // ---------------------------------------------------------------------
-        // 3. JALANKAN OPERASI INFERENSI TFLITE NATIVE
-        // ---------------------------------------------------------------------
-        _interpreter!.run(inputBuffer, outputBuffer);
-        
-        // ---------------------------------------------------------------------
-        // 4. PENENTUAN PREDIKSI TERBAIK (ArgMax)
-        // Cari kelas dengan probabilitas (skor kecocokan) tertinggi.
-        // ---------------------------------------------------------------------
-        final List<double> probabilities = List<double>.from(outputBuffer[0]);
-        double maxProb = -1.0;
-        int maxIndex = -1;
-        
-        for (int i = 0; i < probabilities.length; i++) {
-          if (probabilities[i] > maxProb) {
-            maxProb = probabilities[i];
-            maxIndex = i;
-          }
-        }
-        
-        // Hanya terima prediksi jika tingkat akurasi (confidence) >= 50% (0.5)
-        if (maxIndex != -1 && maxProb >= 0.5) {
-          final label = getLabelFromIndex(maxIndex);
-          return PredictionResult(
-            label: label,
-            confidence: maxProb,
-            inferenceSource: 'TFLite Model',
-          );
-        }
-      } catch (e) {
-        debugPrint('Gagal menjalankan inferensi TFLite: $e');
-      }
-    }
-
-    // Jika TFLite gagal atau tidak mendeteksi apa pun, kembalikan tanda Tanya
-    return PredictionResult(
-      label: '?',
+  /// Reset buffer smoothing dan window
+  void resetBuffer() {
+    _slidingWindowWord.clear();
+    _recentAlphabetLabels.clear();
+    _missingFramesCount = 0;
+    _consecutiveHighMotionFrames = 0;
+    _consecutiveLowMotionFrames = 0;
+    _isInDynamicWordMode = false;
+    _lastPrediction = PredictionResult(
+      label: 'Menunggu Gesture...',
       confidence: 0.0,
-      inferenceSource: 'Tidak Ada TFLite',
+      inferenceSource: 'SIBI Auto-Hybrid',
     );
   }
 
-  /// Memetakan indeks keluaran model TFLite ke Label teks karakter/huruf SIBI
-  String getLabelFromIndex(int index) {
-    // Gunakan daftar label dinamis jika file labels.txt berhasil dimuat
-    if (_dynamicLabels.isNotEmpty) {
-      if (index >= 0 && index < _dynamicLabels.length) {
-        return _dynamicLabels[index];
+  /// Eksekusi klasifikasi cerdas dalam satu mode otomatis (Auto-Routing) dengan cadangan manual
+  @override
+  PredictionResult classify(List<AppHand> hands, {String mode = 'auto'}) {
+    if (hands.isEmpty) {
+      _missingFramesCount++;
+      if (_missingFramesCount > 10) {
+        _slidingWindowWord.clear();
+        _recentAlphabetLabels.clear();
+        _consecutiveHighMotionFrames = 0;
+        _consecutiveLowMotionFrames = 0;
+        _isInDynamicWordMode = false;
       }
-      return '?';
+      return PredictionResult(
+        label: 'Menunggu Gesture...',
+        confidence: 0.0,
+        inferenceSource: 'SIBI Auto-Hybrid',
+      );
     }
 
-    // Fallback daftar label statis bawaan aplikasi
-    const labels = [
-      'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N',
-      'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
-      'Halo', 'Saya', 'Terima Kasih', 'Sama-sama'
-    ];
-    if (index >= 0 && index < labels.length) {
-      return labels[index];
+    _missingFramesCount = 0;
+    final hand = hands[0];
+
+    // ==========================================================
+    // 1. UPDATE SLIDING WINDOW KATA (30 FRAME) & HITUNG GERAKAN
+    // ==========================================================
+    final rawWord = hand.toWristRelativeRawVector(mirror: false);
+    final normWord = _normalize(rawWord, _wordScalerMean, _wordScalerScale);
+
+    _slidingWindowWord.add(normWord);
+    if (_slidingWindowWord.length > _sequenceLength) {
+      _slidingWindowWord.removeAt(0);
+    }
+
+    // Hitung varians gerakan temporal tangan (Delta E)
+    final double motionEnergy = _calculateTemporalMotionEnergy(_slidingWindowWord);
+
+    // ==========================================================
+    // 2. HYSTERESIS STATE MACHINE (MENCEGAH MODE BERKEDIP)
+    // ==========================================================
+    if (motionEnergy >= _dynamicMotionThreshold) {
+      _consecutiveHighMotionFrames++;
+      _consecutiveLowMotionFrames = 0;
+      if (_consecutiveHighMotionFrames >= _minFramesToEnterWordMode) {
+        _isInDynamicWordMode = true;
+      }
+    } else {
+      _consecutiveLowMotionFrames++;
+      _consecutiveHighMotionFrames = 0;
+      if (_consecutiveLowMotionFrames >= _minFramesToExitWordMode) {
+        _isInDynamicWordMode = false;
+      }
+    }
+
+    // Tentukan apakah kita harus menjalankan inferensi kata dan huruf
+    final bool allowWordInference = (mode == 'word') || (mode == 'auto');
+    final bool allowAlphaInference = (mode == 'alphabet') || (mode == 'auto');
+
+    // ==========================================================
+    // 3. JALANKAN INFERENSI KATA (CNN-LSTM) JIKA DIIZINKAN & BUFFER CUKUP
+    // ==========================================================
+    _InferenceOutput? wordResult;
+    if (allowWordInference && _wordInterpreter != null && _slidingWindowWord.length == _sequenceLength) {
+      wordResult = _runWordLSTMInference(_slidingWindowWord);
+    }
+
+    // ==========================================================
+    // 4. JALANKAN INFERENSI HURUF (DNN SINGLE-FRAME)
+    // ==========================================================
+    _InferenceOutput? alphaResult;
+    if (allowAlphaInference && _alphabetInterpreter != null) {
+      final rawAlphaNormal = hand.toWristRelativeRawVector(mirror: false);
+      final rawAlphaMirrored = hand.toWristRelativeRawVector(mirror: true);
+      final normAlphaNormal = _normalize(rawAlphaNormal, _alphabetScalerMean, _alphabetScalerScale);
+      final normAlphaMirrored = _normalize(rawAlphaMirrored, _alphabetScalerMean, _alphabetScalerScale);
+
+      final resNormal = _runSingleInference(_alphabetInterpreter!, normAlphaNormal, _alphabetLabels.length);
+      final resMirrored = _runSingleInference(_alphabetInterpreter!, normAlphaMirrored, _alphabetLabels.length);
+      alphaResult = (resNormal.maxProb >= resMirrored.maxProb) ? resNormal : resMirrored;
+    }
+
+    // ==========================================================
+    // 5. ARBITRASE HASIL BERDASARKAN MODE & HYSTERESIS
+    // ==========================================================
+    
+    // A. MODE CADANGAN: KHUSUS KATA
+    if (mode == 'word') {
+      if (wordResult != null &&
+          wordResult.maxProb >= _wordConfidenceThreshold &&
+          wordResult.maxIndex != -1) {
+        final wordLabel = (wordResult.maxIndex < _wordLabels.length)
+            ? _wordLabels[wordResult.maxIndex]
+            : '?';
+        _lastPrediction = PredictionResult(
+          label: wordLabel,
+          confidence: wordResult.maxProb,
+          inferenceSource: 'Model 2: Kata Dinamis (CNN-LSTM)',
+        );
+        return _lastPrediction;
+      }
+      return PredictionResult(
+        label: 'Menunggu Gerakan Kata...',
+        confidence: wordResult?.maxProb ?? 0.0,
+        inferenceSource: 'Model 2: Kata Dinamis (CNN-LSTM)',
+      );
+    }
+
+    // B. MODE CADANGAN: KHUSUS HURUF
+    if (mode == 'alphabet') {
+      if (alphaResult != null &&
+          alphaResult.maxProb >= _alphabetConfidenceThreshold &&
+          alphaResult.maxIndex != -1) {
+        final alphaLabel = (alphaResult.maxIndex < _alphabetLabels.length)
+            ? _alphabetLabels[alphaResult.maxIndex]
+            : '?';
+        _recentAlphabetLabels.add(alphaLabel);
+        if (_recentAlphabetLabels.length > _smoothingWindowSize) {
+          _recentAlphabetLabels.removeAt(0);
+        }
+        final smoothedLabel = _getMajorityLabel(_recentAlphabetLabels);
+        _lastPrediction = PredictionResult(
+          label: smoothedLabel,
+          confidence: alphaResult.maxProb,
+          inferenceSource: 'Model 1: Ejaan Huruf (DNN)',
+        );
+        return _lastPrediction;
+      }
+      return PredictionResult(
+        label: 'Menunggu Pose Huruf...',
+        confidence: alphaResult?.maxProb ?? 0.0,
+        inferenceSource: 'Model 1: Ejaan Huruf (DNN)',
+      );
+    }
+
+    // C. MODE UTAMA: AUTO-HYBRID DENGAN HYSTERESIS (ALUR NORMAL SKRIPSI)
+    // Syarat menampilkan kata:
+    // 1. Status hysteresis berada di mode kata (_isInDynamicWordMode == true)
+    // 2. Model Kata memiliki confidence >= 0.65
+    // Jika tidak memenuhi, sistem otomatis jatuh kembali (fallback) ke mode huruf.
+    if (_isInDynamicWordMode &&
+        wordResult != null &&
+        wordResult.maxProb >= _wordConfidenceThreshold &&
+        wordResult.maxIndex != -1) {
+      final wordLabel = (wordResult.maxIndex < _wordLabels.length)
+          ? _wordLabels[wordResult.maxIndex]
+          : '?';
+
+      // Reset antrean smoothing huruf agar tidak bercampur dengan kata
+      _recentAlphabetLabels.clear();
+
+      _lastPrediction = PredictionResult(
+        label: wordLabel,
+        confidence: wordResult.maxProb,
+        inferenceSource: 'Model 2: Kata Dinamis (CNN-LSTM)',
+      );
+      return _lastPrediction;
+    }
+
+    // Fallback Ejaan Huruf (Jika tangan diam/stabil ATAU confidence kata < 0.65)
+    if (alphaResult != null &&
+        alphaResult.maxProb >= _alphabetConfidenceThreshold &&
+        alphaResult.maxIndex != -1) {
+      final alphaLabel = (alphaResult.maxIndex < _alphabetLabels.length)
+          ? _alphabetLabels[alphaResult.maxIndex]
+          : '?';
+
+      _recentAlphabetLabels.add(alphaLabel);
+      if (_recentAlphabetLabels.length > _smoothingWindowSize) {
+        _recentAlphabetLabels.removeAt(0);
+      }
+      final smoothedLabel = _getMajorityLabel(_recentAlphabetLabels);
+
+      _lastPrediction = PredictionResult(
+        label: smoothedLabel,
+        confidence: alphaResult.maxProb,
+        inferenceSource: 'Model 1: Ejaan Huruf (DNN)',
+      );
+      return _lastPrediction;
+    }
+
+    // Default: Menunggu Gesture Jelas
+    return PredictionResult(
+      label: 'Menunggu Gesture...',
+      confidence: 0.0,
+      inferenceSource: 'SIBI Auto-Hybrid',
+    );
+  }
+
+  /// Menghitung tingkat varians pergerakan tangan dalam sekuens 30 frame
+  double _calculateTemporalMotionEnergy(List<List<double>> window) {
+    if (window.length < 10) return 0.0;
+    double totalDisplacement = 0.0;
+    // Hitung pergeseran koordinat ujung jari telunjuk & tengah (titik 8 dan 12)
+    for (int i = 1; i < window.length; i++) {
+      final prev = window[i - 1];
+      final curr = window[i];
+      for (int k = 0; k < 63; k += 3) {
+        final dx = curr[k] - prev[k];
+        final dy = curr[k + 1] - prev[k + 1];
+        final dz = curr[k + 2] - prev[k + 2];
+        totalDisplacement += math.sqrt(dx * dx + dy * dy + dz * dz);
+      }
+    }
+    return totalDisplacement / (window.length * 21);
+  }
+
+  /// Eksekusi inferensi Model 2 (CNN-LSTM)
+  _InferenceOutput _runWordLSTMInference(List<List<double>> sequence) {
+    var inputSeq = [sequence]; // shape [1, 30, 63]
+    var outputBuf = List<List<double>>.generate(1, (_) => List<double>.filled(_wordLabels.length, 0.0));
+    _wordInterpreter!.run(inputSeq, outputBuf);
+
+    final probs = outputBuf[0];
+    double maxProb = -1.0;
+    int maxIndex = -1;
+    for (int i = 0; i < probs.length; i++) {
+      if (probs[i] > maxProb) {
+        maxProb = probs[i];
+        maxIndex = i;
+      }
+    }
+    return _InferenceOutput(maxIndex, maxProb);
+  }
+
+  /// Eksekusi inferensi Model 1 (DNN)
+  _InferenceOutput _runSingleInference(Interpreter interp, List<double> features, int numClasses) {
+    var input = [features];
+    var output = List<List<double>>.generate(1, (_) => List<double>.filled(numClasses, 0.0));
+    interp.run(input, output);
+
+    final probs = output[0];
+    double maxProb = -1.0;
+    int maxIndex = -1;
+    for (int i = 0; i < probs.length; i++) {
+      if (probs[i] > maxProb) {
+        maxProb = probs[i];
+        maxIndex = i;
+      }
+    }
+    return _InferenceOutput(maxIndex, maxProb);
+  }
+
+  /// Normalisasi koordinat
+  List<double> _normalize(List<double> raw, List<double> mean, List<double> scale) {
+    if (mean.isEmpty || scale.isEmpty) return raw;
+    final List<double> result = List.filled(63, 0.0);
+    for (int i = 0; i < 63; i++) {
+      final s = scale[i] != 0 ? scale[i] : 1.0;
+      result[i] = (raw[i] - mean[i]) / s;
+    }
+    return result;
+  }
+
+  /// Majority voting smoothing
+  String _getMajorityLabel(List<String> labels) {
+    if (labels.isEmpty) return 'Menunggu Gesture...';
+    final counts = <String, int>{};
+    for (var l in labels) {
+      counts[l] = (counts[l] ?? 0) + 1;
+    }
+    String best = labels.last;
+    int maxCount = 0;
+    counts.forEach((k, v) {
+      if (v > maxCount) {
+        maxCount = v;
+        best = k;
+      }
+    });
+    return best;
+  }
+
+  @override
+  String getLabelFromIndex(int index) {
+    if (index >= 0 && index < _alphabetLabels.length) {
+      return _alphabetLabels[index];
     }
     return '?';
   }
 
-  /// Tutup interpreter untuk membebaskan alokasi memori
+  @override
   void dispose() {
-    _interpreter?.close();
+    _alphabetInterpreter?.close();
+    _wordInterpreter?.close();
   }
+}
+
+PlatformClassifier createClassifier() => SibiClassifier();
+
+class _InferenceOutput {
+  final int maxIndex;
+  final double maxProb;
+  _InferenceOutput(this.maxIndex, this.maxProb);
 }

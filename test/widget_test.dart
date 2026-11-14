@@ -40,7 +40,7 @@ void main() {
       final dummyLms = List.generate(21, (i) => AppLandmark(x: i * 0.05, y: i * 0.05, z: i * 0.05));
       final dummyHand = AppHand(landmarks: dummyLms);
       
-      final result = classifier.classify(dummyHand);
+      final result = classifier.classify([dummyHand]);
 
       expect(result.inferenceSource, 'Rule-Based Fallback');
       expect(result.label, isNotEmpty);
