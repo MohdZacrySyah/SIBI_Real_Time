@@ -133,10 +133,24 @@ class SibiClassifier extends PlatformClassifier {
     );
   }
 
+  // Pengukuran waktu satu pemanggilan interpreter.run() (untuk benchmark)
+  double _alphaInvokeSumMs = 0.0;
+  int _alphaInvokeCount = 0;
+  double _lastWordInvokeMs = -1.0;
+
+  @override
+  double get lastAlphaInvokeMs => _alphaInvokeCount == 0 ? -1.0 : _alphaInvokeSumMs / _alphaInvokeCount;
+
+  @override
+  double get lastWordInvokeMs => _lastWordInvokeMs;
+
   /// Eksekusi klasifikasi cerdas dalam satu mode otomatis (Auto-Routing) dengan cadangan manual
   @override
   PredictionResult classify(List<AppHand> hands, {String mode = 'auto'}) {
     final inferenceStopwatch = Stopwatch()..start();
+    _alphaInvokeSumMs = 0.0;
+    _alphaInvokeCount = 0;
+    _lastWordInvokeMs = -1.0;
     if (hands.isEmpty) {
       _missingFramesCount++;
       if (_missingFramesCount > 10) {
@@ -359,7 +373,10 @@ class SibiClassifier extends PlatformClassifier {
   _InferenceOutput _runWordLSTMInference(List<List<double>> sequence) {
     var inputSeq = [sequence]; // shape [1, 30, 63]
     var outputBuf = List<List<double>>.generate(1, (_) => List<double>.filled(_wordLabels.length, 0.0));
+    final invokeSw = Stopwatch()..start();
     _wordInterpreter!.run(inputSeq, outputBuf);
+    invokeSw.stop();
+    _lastWordInvokeMs = invokeSw.elapsedMicroseconds / 1000.0;
 
     final probs = outputBuf[0];
     double maxProb = -1.0;
@@ -377,7 +394,11 @@ class SibiClassifier extends PlatformClassifier {
   _InferenceOutput _runSingleInference(Interpreter interp, List<double> features, int numClasses) {
     var input = [features];
     var output = List<List<double>>.generate(1, (_) => List<double>.filled(numClasses, 0.0));
+    final invokeSw = Stopwatch()..start();
     interp.run(input, output);
+    invokeSw.stop();
+    _alphaInvokeSumMs += invokeSw.elapsedMicroseconds / 1000.0;
+    _alphaInvokeCount++;
 
     final probs = output[0];
     double maxProb = -1.0;

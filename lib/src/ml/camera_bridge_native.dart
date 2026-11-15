@@ -15,12 +15,14 @@ import '../../src/ui/camera_view.dart';
 import 'hand_landmark.dart';
 import '../state/sibi_state.dart';
 import 'sibi_vision_ffi.dart';
+import 'benchmark_logger.dart';
 
 class NativeCameraBridge extends PlatformCameraBridge {
   CameraController? _controller;
   mp.HandLandmarkerPlugin? _landmarkerPlugin;
   StreamSubscription<List<mp.Hand>>? _landmarkSubscription;
   bool _isStreamProcessing = false;
+  DateTime? _frameStart; // waktu frame kamera diterima (Android)
   List<CameraDescription>? _cachedCameras;
   CameraLensDirection _preferredLensDirection = CameraLensDirection.front;
 
@@ -43,6 +45,7 @@ class NativeCameraBridge extends PlatformCameraBridge {
 
   @override
   Future<void> disposeCamera(CameraViewState state) async {
+    await BenchmarkLogger.instance.stopSession();
     if (Platform.isWindows) {
       await _disposeWindowsFFI(state);
     } else {
@@ -115,6 +118,10 @@ class NativeCameraBridge extends PlatformCameraBridge {
               inferenceTimeMs: message.inferenceTimeMs,
               hands: message.hands,
               imageBytes: message.imageBytes,
+              timestamp: message.frameStartMicros > 0
+                  ? DateTime.fromMicrosecondsSinceEpoch(message.frameStartMicros)
+                  : null,
+              landmarkTimeMs: message.inferenceTimeMs,
             ));
           }
         }
@@ -210,6 +217,7 @@ class NativeCameraBridge extends PlatformCameraBridge {
           await _controller!.startImageStream((CameraImage image) {
             if (!_isStreamProcessing && _landmarkerPlugin != null && _controller != null) {
               _isStreamProcessing = true;
+              _frameStart = DateTime.now();
               try {
                 _landmarkerPlugin!.processFrame(
                   image,
@@ -274,6 +282,9 @@ class NativeCameraBridge extends PlatformCameraBridge {
       return;
     }
 
+    final frameStart = _frameStart ?? DateTime.now();
+    final landmarkMs = DateTime.now().difference(frameStart).inMicroseconds / 1000.0;
+
     try {
       if (hands.isEmpty) {
         state.onPredictionResult(CameraPrediction(
@@ -281,6 +292,8 @@ class NativeCameraBridge extends PlatformCameraBridge {
           confidence: 0.0,
           inferenceTimeMs: 0.0,
           hands: [],
+          timestamp: frameStart,
+          landmarkTimeMs: landmarkMs,
         ));
         return;
       }
@@ -339,6 +352,8 @@ class NativeCameraBridge extends PlatformCameraBridge {
         confidence: 0.0,
         inferenceTimeMs: 0.0,
         hands: appHands,
+        timestamp: frameStart,
+        landmarkTimeMs: landmarkMs,
       ));
     } finally {
       _isStreamProcessing = false;
@@ -443,6 +458,7 @@ class FfiResponse {
   final double confidence;
   final double inferenceTimeMs;
   final double latencyMs;
+  final int frameStartMicros;
   final bool? initResult;
   final String? errorMessage;
 
@@ -453,6 +469,7 @@ class FfiResponse {
     required this.confidence,
     required this.inferenceTimeMs,
     required this.latencyMs,
+    this.frameStartMicros = 0,
     this.initResult,
     this.errorMessage,
   });
@@ -627,7 +644,8 @@ void _runFfiLoop(
           label: label,
           confidence: confidence,
           inferenceTimeMs: inferenceTimeMs,
-          latencyMs: inferenceTimeMs + 5.0,
+          latencyMs: inferenceTimeMs,
+          frameStartMicros: startTime.microsecondsSinceEpoch,
         ));
       }
     } catch (e) {

@@ -19,6 +19,11 @@ abstract class PlatformClassifier {
   String get lastErrorMessage;
   Future<bool> initialize();
   PredictionResult classify(List<AppHand> hands, {String mode = 'auto'});
+
+  /// Waktu rata-rata satu pemanggilan interpreter.run() Model 1 / Model 2 pada
+  /// frame terakhir (ms). Bernilai -1 jika model tidak dijalankan. (Benchmark)
+  double get lastAlphaInvokeMs => -1.0;
+  double get lastWordInvokeMs => -1.0;
   String getLabelFromIndex(int index);
   void dispose();
 }

@@ -9,6 +9,7 @@ import '../ml/platform_classifier.dart';
 import '../state/sibi_state.dart';
 import '../ml/camera_bridge.dart';
 import '../ml/platform_camera_bridge.dart';
+import '../ml/benchmark_logger.dart';
 import 'theme.dart';
 
 class CameraView extends StatefulWidget {
@@ -114,6 +115,24 @@ class CameraViewState extends State<CameraView> {
       latencyMs: latencyMs,
       confidence: result.confidence,
     );
+
+    // Pencatatan data benchmark (hanya aktif dengan --dart-define=BENCH=true)
+    if (BenchmarkLogger.enabled) {
+      BenchmarkLogger.instance.logFrame(
+        platform: defaultTargetPlatform.name,
+        mode: state.translationMode,
+        engine: result.inferenceSource,
+        handDetected: prediction.hands.isNotEmpty,
+        label: result.label,
+        confidence: result.confidence,
+        fps: _currentCalculatedFps,
+        landmarkMs: prediction.landmarkTimeMs,
+        alphaInvokeMs: widget.classifier.lastAlphaInvokeMs,
+        wordInvokeMs: widget.classifier.lastWordInvokeMs,
+        classifyMs: result.inferenceTimeMs,
+        latencyMs: latencyMs,
+      );
+    }
 
     // Update status mesin aktif di SibiState ("Huruf", "Kata", atau "Menunggu")
     if (result.inferenceSource.contains('Kata')) {
